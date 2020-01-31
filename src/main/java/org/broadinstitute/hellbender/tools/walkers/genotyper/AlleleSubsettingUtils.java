@@ -100,12 +100,25 @@ public final class AlleleSubsettingUtils {
                 gb.attribute(GATKVCFConstants.STRAND_COUNT_BY_SAMPLE_KEY, newSACs);
             }
 
+            //don't allow NON_REF genotype calls and set PLs to all zeros because we have no idea what's going on here
+            if (gb.make().getAlleles().contains(Allele.NON_REF_ALLELE)) {
+                gb.alleles(Arrays.asList(Allele.NO_CALL, Allele.NO_CALL));
+                gb.PL(new int[newLikelihoods.length]);
+            }
+
             // restrict AD to the new allele subset
             if(g.hasAD()) {
                 final int[] oldAD = g.getAD();
                 final int[] newAD = IntStream.range(0, allelesToKeep.size()).map(n -> oldAD[allelePermutation.fromIndex(n)]).toArray();
+                final int nonRefIndex = allelesToKeep.indexOf(Allele.NON_REF_ALLELE);
+                if (nonRefIndex < newAD.length) {
+                    newAD[nonRefIndex] = 0;  //we will "lose" coverage here, but otherwise merging NON_REF AD counts with other alleles "creates" reads
+                }
                 gb.AD(newAD);
             }
+
+
+
             newGTs.add(gb.make());
         }
         return newGTs;
