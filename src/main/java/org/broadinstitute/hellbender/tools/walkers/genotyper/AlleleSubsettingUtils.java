@@ -111,7 +111,7 @@ public final class AlleleSubsettingUtils {
                 final int[] oldAD = g.getAD();
                 final int[] newAD = IntStream.range(0, allelesToKeep.size()).map(n -> oldAD[allelePermutation.fromIndex(n)]).toArray();
                 final int nonRefIndex = allelesToKeep.indexOf(Allele.NON_REF_ALLELE);
-                if (nonRefIndex < newAD.length) {
+                if (nonRefIndex != -1 && nonRefIndex < newAD.length) {
                     newAD[nonRefIndex] = 0;  //we will "lose" coverage here, but otherwise merging NON_REF AD counts with other alleles "creates" reads
                 }
                 gb.AD(newAD);
