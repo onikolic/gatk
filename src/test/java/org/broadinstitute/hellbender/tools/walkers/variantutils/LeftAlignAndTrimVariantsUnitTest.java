@@ -18,7 +18,6 @@ import org.broadinstitute.hellbender.utils.Utils;
 import java.io.UnsupportedEncodingException;
 import java.util.*;
 import java.util.stream.*;
-import java.io.File;
 
 public class LeftAlignAndTrimVariantsUnitTest extends GATKBaseTest {
     final String refBases1 = "GCAGAGCTGACCCTCCCTCCCCTCTCCCAGTGCAACAGCACGGGCGGCGACTGCTTTTACCGAGGCTACACGTCAGGCGTGGCGGCTGTCCAGGACTGGTACCACTTCCACTATGTGGATCTCTGCTGAGGACCAGGAAAGCCAGCACCCGCAGAGACTCTTCCCCAGTGCTCCATACGATCACCATTCTCTGCAGAAGG";
@@ -126,7 +125,7 @@ public class LeftAlignAndTrimVariantsUnitTest extends GATKBaseTest {
 
     @Test(dataProvider = "LeftAlignDataProvider")
     public void testLeftAlign(final VariantContext vc, final ReferenceContext ref, final boolean expectRealigned, final int expectedStart) {
-        final VariantContext realignedV = LeftAlignAndTrimVariants.leftAlign(vc, ref, LeftAlignAndTrimVariants.DEFAULT_MAX_LEADING_BASES);
+        final VariantContext realignedV = LeftAlignAndTrimVariants.leftAlignAndTrim(vc, ref, LeftAlignAndTrimVariants.DEFAULT_MAX_LEADING_BASES, true);
         Assert.assertEquals(realignedV != vc, expectRealigned);
         Assert.assertEquals(realignedV.getStart(), expectedStart);
     }

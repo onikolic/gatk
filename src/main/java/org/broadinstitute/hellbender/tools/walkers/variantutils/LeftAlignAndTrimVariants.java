@@ -177,16 +177,12 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
 
     private VariantContextWriter vcfWriter = null;
 
-    // it is possible that left-alignment changes the order of variants.  For example, an indel in an STR may left align past a
-    // SNP in the same STR that doesn't move.  Thus we can only emit variants that are sufficiently far behind the current one.
-    PriorityQueue<VariantContext> pendingVariants;
+    VariantContext lastVariant;
 
     @Override
     public void onTraversalStart() {
         final Map<String, VCFHeader> vcfHeaders = Collections.singletonMap(getDrivingVariantsFeatureInput().getName(), getHeaderForVariants());
         final SortedSet<String> vcfSamples = VcfUtils.getSortedSampleSet(vcfHeaders, GATKVariantContextUtils.GenotypeMergeType.REQUIRE_UNIQUE);
-
-        pendingVariants = new PriorityQueue<>(new VariantContextComparator(getReferenceDictionary()));
 
         // Initialize VCF header lines
         final Path refPath = referenceArguments.getReferencePath();
@@ -221,17 +217,6 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
      */
     @Override
     public void apply(VariantContext vc, ReadsContext readsContext, ReferenceContext ref, FeatureContext featureContext) {
-
-        // write any pending variants that are sufficiently far to the left that there's no chance of left-aligning new variants past them
-        while (!pendingVariants.isEmpty()) {
-            final VariantContext leftmostPendingVariant = pendingVariants.peek();
-            if (leftmostPendingVariant.getEnd() < vc.getEnd() - maxLeadingBases || !leftmostPendingVariant.contigsMatch(vc)) {
-                vcfWriter.add(pendingVariants.poll());
-            } else {
-                break;
-            }
-        }
-
         final List<VariantContext> vcList = splitMultiallelics ? GATKVariantContextUtils.splitVariantContextToBiallelics(vc, false,
                 GenotypeAssignmentMethod.BEST_MATCH_TO_ORIGINAL, keepOriginalChrCounts) : Collections.singletonList(vc);
 
@@ -242,10 +227,12 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
             if (indelLength > maxIndelSize) {
                 logger.info(String.format("%s (%d) at position %s:%d; skipping that record. Set --max-indel-length >= %d",
                         "Indel is too long", indelLength, splitVariant.getContig(), splitVariant.getStart(), indelLength));
-                pendingVariants.add(splitVariant);
+                lastVariant = splitVariant;
+                vcfWriter.add(splitVariant);
             } else {
-                final VariantContext trimmed = dontTrimAlleles ? splitVariant : GATKVariantContextUtils.trimAlleles(splitVariant, true, true);
-                pendingVariants.add(leftAlign(trimmed, ref, maxLeadingBases));
+                final int distanceToLastVariant = (lastVariant != null && splitVariant.contigsMatch(lastVariant)) ? splitVariant.getStart() - lastVariant.getEnd() : Integer.MAX_VALUE;
+                lastVariant = leftAlignAndTrim(splitVariant, ref, Math.min(maxLeadingBases, distanceToLastVariant - 1), !dontTrimAlleles);
+                vcfWriter.add(lastVariant);
             }
         }
     }
@@ -265,9 +252,6 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
      */
     @Override
     public Object onTraversalSuccess() {
-        while (!pendingVariants.isEmpty()) {
-            vcfWriter.add(pendingVariants.poll());
-        }
         return "SUCCESS";
     }
 
@@ -290,13 +274,13 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
      * @return new VC.
      */
     @VisibleForTesting
-    static VariantContext leftAlign(final VariantContext vc, final ReferenceContext ref, final int maxLeadingBases) {
-        if (!vc.isIndel()) {
+    static VariantContext leftAlignAndTrim(final VariantContext vc, final ReferenceContext ref, final int maxLeadingBases, final boolean trim) {
+        if (!vc.isIndel() || maxLeadingBases <= 0) {
             return vc;
         }
 
-        for(int leadingBases = 10; leadingBases < maxLeadingBases; leadingBases *= 2) {
-            final int refStart = Math.max(vc.getStart() - leadingBases, 1);
+        for(int leadingBases = Math.min(maxLeadingBases, 10); leadingBases <= maxLeadingBases; leadingBases *= 2) {
+            final int refStart = Math.max(vc.getStart() - Math.min(leadingBases, maxLeadingBases), 1);
 
             // reference sequence starting before the variant (to give space for left-alignment) and ending at the variant end
             final byte[] refSeq = ref.getBases(new SimpleInterval(vc.getContig(), refStart, vc.getEnd()));
@@ -311,23 +295,23 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
             }).collect(Collectors.toList());
 
             final List<IndexRange> alleleRanges = vc.getAlleles().stream()
-                    .map(a -> new IndexRange(variantOffsetInRef + 1, variantOffsetInRef + a.length()))
+                    .map(a -> new IndexRange(variantOffsetInRef + 1, variantOffsetInRef + a.length()))  // +1 to ignore the shared base in front
                     .collect(Collectors.toList());
 
             // note that this also shifts the index ranges as a side effect, so below they can be used to output allele bases
             // since trimming is performed elsewhere, we care only about the start shift
-            final int shift = AlignmentUtils.leftAlignAlleles(sequences, alleleRanges, variantOffsetInRef).getLeft();
+            final Pair<Integer, Integer> shifts = AlignmentUtils.normalizeAlleles(sequences, alleleRanges, variantOffsetInRef, trim);
 
-            if (shift == 0) {
+            if (shifts.getLeft() == 0 && shifts.getRight() == 0) {
                 return vc;
-            } else if (shift == variantOffsetInRef) {
+            } else if (shifts.getLeft() == variantOffsetInRef && leadingBases < maxLeadingBases) {
                 continue;
             }
 
             final Map<Allele, Allele> alleleMap = IntStream.range(0, alleleRanges.size()).boxed()
                     .collect(Collectors.toMap(
                             n -> vc.getAlleles().get(n),
-                            n -> Allele.create(Arrays.copyOfRange(sequences.get(n), variantOffsetInRef - shift, variantOffsetInRef - shift + vc.getAlleles().get(n).length()), n == 0)));
+                            n -> Allele.create(Arrays.copyOfRange(sequences.get(n), variantOffsetInRef - shifts.getLeft(), variantOffsetInRef - shifts.getRight() + vc.getAlleles().get(n).length()), n == 0)));
 
             final GenotypesContext newGenotypes = GenotypesContext.create(vc.getNSamples());
             for (final Genotype genotype : vc.getGenotypes()) {
@@ -335,7 +319,7 @@ public class LeftAlignAndTrimVariants extends VariantWalker {
                 newGenotypes.add(new GenotypeBuilder(genotype).alleles(newAlleles).make());
             }
 
-            return new VariantContextBuilder(vc).start(vc.getStart() - shift).stop(vc.getEnd() - shift)
+            return new VariantContextBuilder(vc).start(vc.getStart() - shifts.getLeft()).stop(vc.getEnd() - shifts.getRight())
                     .alleles(alleleMap.values()).genotypes(newGenotypes).make();
         }
 

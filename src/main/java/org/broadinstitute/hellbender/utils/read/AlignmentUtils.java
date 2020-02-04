@@ -805,7 +805,7 @@ public final class AlignmentUtils {
 
         // at this point, we are one base past the end of the read.  Now we traverse the cigar from right to left
         final List<CigarElement> resultRightToLeft = new ArrayList<>();
-        final int refLength = cigar.getCigarElements().stream().mapToInt(e -> lengthOnReference(e)).sum();
+        final int refLength = cigar.getReferenceLength();
         final IndexRange refIndelRange = new IndexRange(readStart + refLength, readStart + refLength);
         final IndexRange readIndelRange = new IndexRange(read.length,read.length);
         for (int n = cigar.numCigarElements() - 1; n >= 0; n--) {
@@ -822,23 +822,25 @@ public final class AlignmentUtils {
             } else {    // there's an indel that we need to left-align
                 // we can left-align into match cigar elements but not into clips
                 final int maxShift = element.getOperator().isAlignment() ? element.getLength() : 0;
-                final Pair<Integer, Integer> shifts = leftAlignAlleles(Arrays.asList(ref, read), Arrays.asList(refIndelRange, readIndelRange), maxShift);
+                final Pair<Integer, Integer> shifts = normalizeAlleles(Arrays.asList(ref, read), Arrays.asList(refIndelRange, readIndelRange), maxShift, true);
 
                 // account for new match alignments on the right due to left-alignment
                 resultRightToLeft.add(new CigarElement(shifts.getRight(), CigarOperator.MATCH_OR_MISMATCH));
 
                 // emit if we didn't go all the way to the start of an alignment block OR we have reached clips OR we have reached the start of the cigar
                 final boolean emitIndel = n == 0 || shifts.getLeft() < maxShift || !element.getOperator().isAlignment();
-                final int remainingBasesOnLeft = element.getLength() - shifts.getLeft();
+                final int newMatchOnLeftDueToTrimming = shifts.getLeft() < 0 ? -shifts.getLeft() : 0;   // we may have actually shifted right to make the alleles parsimonious
+                final int remainingBasesOnLeft = shifts.getLeft() < 0 ? element.getLength() : (element.getLength() - shifts.getLeft());
 
                 if (emitIndel) {  // some of this alignment block remains after left-alignment -- emit the indel
                     resultRightToLeft.add(new CigarElement(refIndelRange.size(), CigarOperator.DELETION));
                     resultRightToLeft.add(new CigarElement(readIndelRange.size(), CigarOperator.INSERTION));
                     refIndelRange.shiftEndLeft(refIndelRange.size());       // ref is empty and points to start of left-aligned indel
                     readIndelRange.shiftEndLeft(readIndelRange.size());     // read is empty and points to start of left-aligned indel
-                    refIndelRange.shiftLeft(remainingBasesOnLeft);          // ref is empty and points to end of element preceding this match block
-                    readIndelRange.shiftLeft(remainingBasesOnLeft);         // read is empty and points to end of element preceding this match block
+                    refIndelRange.shiftLeft(remainingBasesOnLeft + newMatchOnLeftDueToTrimming);          // ref is empty and points to end of element preceding this match block
+                    readIndelRange.shiftLeft(remainingBasesOnLeft + newMatchOnLeftDueToTrimming);         // read is empty and points to end of element preceding this match block
                 }
+                resultRightToLeft.add(new CigarElement(newMatchOnLeftDueToTrimming, CigarOperator.MATCH_OR_MISMATCH));
                 resultRightToLeft.add(new CigarElement(remainingBasesOnLeft, element.getOperator()));
             }
         }
@@ -861,16 +863,20 @@ public final class AlignmentUtils {
      *  the resulting ranges will be shifted by different amounts.  In this case, the shifts are 2 bases in the front and 3 at the end.
      *
      *  Note that we use the convention that the ref allele in the case of an alt insertion, or the alt allele in case of a deletion, is represented
-     *  by [n,n) where n is the last aligned coordinate before the indel.  This makes sense when you think in terms of alignment CIGARs: 
+     *  by [n,n) where n is the last aligned coordinate before the indel.  This makes sense when you think in terms of alignment CIGARs:
+     *  suppose for example we have a 5M5I5M read with start 100.  Then the match bases are [100,105) on the ref and [0,5) on the read and the inserted bases are
+     *  [5,10) on the read and [5,5) on the reference.
      *
      * @param sequences bases of sequences containing different alleles -- could be reference, a haplotype, a read, or subsequences thereof
      * @param bounds    initial ranges (inclusive start, exclusive end) of alleles in same order as {@code sequences}
+     *                  Note that this method adjusts these ranges as a side effect
      * @param maxShift  maximum allowable shift left.  This may be less than the amount demanded by the array bounds.  For example, when
      *                  left-aligning a read with multiple indels, we don't want to realign one indel past another (if they "collide" we merge
      *                  them into a single indel and continue -- see {@link AlignmentUtils::leftAlignIndels}
+     * @param trim      If true, remove redundant shared bases at the start and end of alleles
      * @return          The number of bases the alleles were shifted left such that they still represented the same event.
      */
-    public static Pair<Integer, Integer> leftAlignAlleles(final List<byte[]> sequences, final List<IndexRange> bounds, final int maxShift) {
+    public static Pair<Integer, Integer> normalizeAlleles(final List<byte[]> sequences, final List<IndexRange> bounds, final int maxShift, final boolean trim) {
         Utils.nonEmpty(sequences);
         Utils.validateArg(sequences.size() == bounds.size(), "Must have one initial allele range per sequence");
         bounds.forEach(bound -> Utils.validateArg(maxShift <= bound.getStart(), "maxShift goes past the start of a sequence"));
@@ -880,27 +886,24 @@ public final class AlignmentUtils {
 
         // consume any redundant shared bases at the end of the alleles
         int minSize = bounds.stream().mapToInt(IndexRange::size).min().getAsInt();
-        while (minSize > 0) {
-            if (lastBaseOnRightIsSame(sequences, bounds)) {
-                bounds.forEach(bound -> bound.shiftEndLeft(1));
-                minSize--;
-                endShift++;
-            } else {
-                break;
-            }
+        while (trim && minSize > 0 && lastBaseOnRightIsSame(sequences, bounds)) {
+            bounds.forEach(bound -> bound.shiftEndLeft(1));
+            minSize--;
+            endShift++;
+        }
+
+        while (trim && minSize > 0 && firstBaseOnLeftIsSame(sequences, bounds)) {
+            bounds.forEach(bound -> bound.shiftStart(1));
+            minSize--;
+            startShift--;
         }
 
         // we shift left as long as the last bases on the right are equal among all sequences and the next bases on the left are all equal.
         // if a sequence is empty (eg the reference relative to an insertion alt allele) the last base on the right is the next base on the left
-        for (int shift = 0; shift < maxShift; shift++) {
-            if (nextBaseOnLeftIsSame(sequences, bounds) && lastBaseOnRightIsSame(sequences, bounds)) {
+        while( startShift < maxShift && nextBaseOnLeftIsSame(sequences, bounds) && lastBaseOnRightIsSame(sequences, bounds)) {
                 bounds.forEach(b -> b.shiftLeft(1));
                 startShift++;
                 endShift++;
-            } else {
-                break;
-
-            }
         }
 
         return ImmutablePair.of(startShift, endShift);
@@ -911,6 +914,17 @@ public final class AlignmentUtils {
         final byte lastBaseOnRight = sequences.get(0)[bounds.get(0).getEnd() - 1];
         for(int n = 0; n < sequences.size(); n++) {
             if (sequences.get(n)[bounds.get(n).getEnd() - 1] != lastBaseOnRight) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // do all sequences share a common first base
+    private static boolean firstBaseOnLeftIsSame(final List<byte[]> sequences, final List<IndexRange> bounds) {
+        final byte nextBaseOnLeft = sequences.get(0)[bounds.get(0).getStart()];
+        for(int n = 0; n < sequences.size(); n++) {
+            if (sequences.get(n)[bounds.get(n).getStart()] != nextBaseOnLeft) {
                 return false;
             }
         }
