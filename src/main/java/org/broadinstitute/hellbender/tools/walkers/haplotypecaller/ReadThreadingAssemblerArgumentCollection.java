@@ -53,8 +53,10 @@ public abstract class ReadThreadingAssemblerArgumentCollection implements Serial
     public int snpPadding = 20;
 
     /**
-     * This argument is meant for debugging and is not immediately useful for normal analysis use.
+     * This argument is meant for debugging. Output a -L parsable summary file with all of the boundaries and summary features of each
+     * region the assembly engine assembled.
      */
+    @Hidden
     @Argument(fullName="active-region-out", doc="Write debug interval list file containing summary info about each active region", optional = true)
     public String assemblyRegionOutput = null;
 
